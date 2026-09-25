@@ -8,7 +8,7 @@ Per-repo configuration lives in `.no-mistakes.yaml` at the root of your reposito
 :::caution[Security: gate-control fields are read from the default branch]
 `commands.*` and `gates[].command` execute arbitrary shell on the daemon host via `sh -c` / `cmd.exe /c`, and `agent` selects which process launches there (including ordered fallback lists, ACP aliases such as `cursor`, and `acp:` targets) with the maintainer's credentials.
 To prevent a supply-chain attack where a contributor lands a hostile value on a gated branch, the daemon always reads **`commands` and `agent` from your default branch** (e.g. `origin/main`), never from the pushed SHA, and reads them at the exact commit a fresh fetch resolved (so a stale `origin/<default>` ref cannot serve a value the live default branch removed).
-The daemon also reads `document.instructions`, `review.path_instructions`, `gates`, `protected_paths`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, `ci.revalidate_repairs`, `rebase.strategy`, `test.instructions`, `test.allow_approve_over_failure`, `test.evidence.branch`, `pr.template`, and `pr.publish_intent` only from that trusted copy.
+The daemon also reads `document.instructions`, `review.path_instructions`, `gates`, `crap`, `protected_paths`, `disable_project_settings`, `no_ci`, `ci.rerun_transient`, `ci.revalidate_repairs`, `rebase.strategy`, `test.instructions`, `test.allow_approve_over_failure`, `test.evidence.branch`, `pr.template`, and `pr.publish_intent` only from that trusted copy.
 `pr.base_branch` is trusted-default-branch-only as well, but unlike those fields it follows the same `allow_repo_commands: true` opt-in exception as `commands`/`agent` (see [`pr.base_branch`](#prbase_branch) below).
 If the default branch cannot be fetched and resolved to a readable commit, or its present `.no-mistakes.yaml` cannot be read and parsed, the run aborts before launching an agent.
 A readable default-branch tree with no `.no-mistakes.yaml` is valid and uses defaults.
@@ -501,6 +501,74 @@ A gate executes shell on the daemon host, so it is honored **only from the trust
 That opt-in deliberately does not extend here. It covers a pushed branch re-running its own suite through `commands.*`; a gate instead defines what validating the branch *means*, so a contributor must not be able to declare, retarget, or delete the check that clears them.
 
 What that boundary protects is the gate's *declaration*, not the repository files its command invokes. The command runs in the run worktree, which is checked out at the pushed head, so a contributor who can edit the script or make target it calls can still change what it checks. `commands.test` and `commands.lint` have the same property. When a contributor must not be able to weaken a gate, point `command` at logic that does not live in the repository.
+
+### crap
+
+Scores the change's functions with the CRAP (Change Risk Anti-Patterns) metric — `CC²·(1−coverage)³+CC` — and gates the run on a per-language threshold. It runs as a built-in check immediately after `lint`, before `push`.
+
+| | |
+|---|---|
+| Type | `object` with `enabled`, `threshold`, `scope`, `max_findings`, `include_tests`, `require_fresh_reports`, `languages`, optional per-language blocks, and `command` |
+| Default | Disabled; the step does not exist in the pipeline |
+
+```yaml
+crap:
+  enabled: true
+  # threshold: 30        # optional repo-wide override
+  scope: changed         # changed (default) | all
+  # max_findings: 20     # findings per round; the rest are summarized
+  # include_tests: false # default excludes test files from scoring
+  # require_fresh_reports: true  # default true
+  languages: [python, typescript]
+
+  python:
+    # collect: "python -m coverage json && python -m radon cc -j -O .crap/radon.json src"
+    # complexity: .crap/radon.json
+    # coverage: coverage.json
+
+  java:
+    # jacoco: target/site/jacoco/jacoco.xml
+
+  typescript:
+    # complexity: .crap/eslint.json
+    # coverage: coverage/coverage-final.json
+```
+
+CRAP is larger for code that is both complex and under-tested. A function fails when its score strictly exceeds the *effective* threshold for its language: the language block's `threshold`, else the repo-wide `threshold`, else the language default. Defaults follow each ecosystem's own tooling — Python 30 (`pytest-crap`), Java 8 (`crap4java`), JavaScript/TypeScript 30 (community convention) — and are tunable per language. A fully covered function scores exactly its complexity, so a threshold must stay above the highest complexity you accept.
+
+`enabled: true` requires at least one active language: an entry in `languages`, a language block, or `command`.
+
+#### Reports and collect
+
+The step does not run tests or builds. It reads report files that the repository's existing tooling produces (usually from `commands.test`):
+
+- **python**: `radon cc -j` for complexity and `coverage json` for line coverage; per-function coverage is the executed lines within the function's range.
+- **java**: a single `target/site/jacoco/jacoco.xml`, which carries both cyclomatic complexity and branch (or line) coverage per method.
+- **javascript/typescript**: `coverage-final.json` (Istanbul) for statement coverage and function boundaries, plus `eslint --format json` run with the built-in `complexity` rule at `max: 1` for per-function complexity. The two reports are matched by file and function start line. Running the rule at `max: 1` means every function with complexity ≥ 2 is reported; complexity-1 functions can never exceed a CRAP of 2, so nothing is missed for any threshold > 2.
+
+Each language block can also declare a `collect` command run before its reports are read (after `commands.prepare`), for the one-step case where the report is cheap to regenerate — e.g. `python -m coverage json`. A non-zero exit fails the step.
+
+As an escape hatch for other languages or a custom pipeline, `command` runs a shell command whose stdout is a normalized report (a JSON array under a `functions` key with `file`, `name`, `start_line`, `end_line`, `complexity`, `covered`, `total`, and `measure` ∈ `line|branch|statement`). `command` is mutually exclusive with per-language report paths and `collect`.
+
+#### Scope
+
+`scope: changed` (default) scores only functions whose line range intersects the lines the change added or modified, so legacy debt does not block a branch that merely touches a file. `scope: all` scores every function in the reports. In both modes the repository's `ignore_patterns` are respected and test files are excluded unless `include_tests: true`.
+
+A configured language with in-scope files whose reports contain no functions fails the step closed: that is a wrong path or wrong globs, never a clean result.
+
+#### Failure and repair
+
+Any function over the effective threshold produces one `error`/`ask-user` finding carrying its complexity and coverage. The step parks; answering with `fix` runs one agent repair round (raise coverage, or simplify the function) and re-evaluates against regenerated reports. Like a repository-declared gate, it never repairs on its own initiative and cannot be pre-skipped by a pushed branch.
+
+The PR body gains a **Code Quality (CRAP)** section listing the worst functions, and the pipeline attestation carries a machine-readable `crap` field (`thresholds`, `scope`, `evaluated`, `unmeasured`, `worst`) that is omitted when the report was measured at a head other than the one being attested.
+
+#### Freshness
+
+With `require_fresh_reports: true` (default), a report older than this run's test step fails the step: gating on a report that describes pre-change code would certify the wrong tree. Set it to `false` only when the reports are generated elsewhere with known-good timing.
+
+#### Trust
+
+The whole block is honored **only from the trusted default-branch copy** of `.no-mistakes.yaml`, regardless of [`allow_repo_commands`](#allow_repo_commands). It reads report files from the worktree, may run `collect`/`command` shell on the daemon host, and its thresholds decide whether the run parks, so a contributor must not be able to raise their own threshold, aim a report path at an empty file, or supply the command that clears them.
 
 ### Command process lifetime
 

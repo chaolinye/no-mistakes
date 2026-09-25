@@ -27,7 +27,25 @@ type Gate struct {
 	Name    string         `yaml:"name" json:"name"`
 	After   types.StepName `yaml:"after" json:"after"`
 	Command string         `yaml:"command" json:"command,omitempty"`
+	// Kind selects a built-in evaluator instead of a shell command. Empty means
+	// "command". It is internal plumbing: the reserved value "crap" is minted by
+	// the daemon from the top-level crap: block so the check rides the same
+	// run-pinned gate list a declared gate does. A repository cannot write Kind
+	// or Crap in YAML; UnmarshalYAML rejects both.
+	Kind string `yaml:"-" json:"kind,omitempty"`
+	// Crap is the resolved CRAP configuration for Kind == "crap". It is carried
+	// in the run's pinned gate list so recovery executes the parameters the run
+	// was created with rather than whatever the default branch says today.
+	Crap *Crap `yaml:"-" json:"crap,omitempty"`
 }
+
+// GateKindCrap is the built-in CRAP scoring evaluator.
+const GateKindCrap = "crap"
+
+// GateNameCrap is the reserved gate name of the built-in CRAP step. A
+// repository-declared gate must not shadow it. types owns the identity because
+// the derived step name is what every display surface and the pin key on.
+const GateNameCrap = types.BuiltinCrapGateLabel
 
 func (g *Gate) UnmarshalYAML(value *yaml.Node) error {
 	var decoded struct {
@@ -35,12 +53,17 @@ func (g *Gate) UnmarshalYAML(value *yaml.Node) error {
 		After        types.StepName `yaml:"after"`
 		Command      string         `yaml:"command"`
 		Instructions yaml.Node      `yaml:"instructions"`
+		Kind         string         `yaml:"kind"`
+		Crap         yaml.Node      `yaml:"crap"`
 	}
 	if err := value.Decode(&decoded); err != nil {
 		return err
 	}
 	if !decoded.Instructions.IsZero() {
 		return fmt.Errorf("instructions: agent gates are not supported; use command")
+	}
+	if decoded.Kind != "" || !decoded.Crap.IsZero() {
+		return fmt.Errorf("kind/crap: built-in gates are not user-declarable; configure the top-level crap: block instead")
 	}
 	*g = Gate{Name: decoded.Name, After: decoded.After, Command: decoded.Command}
 	return nil
@@ -111,6 +134,9 @@ func validateGates(gates []Gate) error {
 		if types.IsCoreStepName(types.StepName(name)) {
 			return fmt.Errorf("gates[%d].name %q is a core step name; an extra gate must not shadow a core step", i, name)
 		}
+		if name == GateNameCrap && gate.Kind != GateKindCrap {
+			return fmt.Errorf("gates[%d].name %q is reserved for the built-in CRAP step; configure the top-level crap: block instead", i, name)
+		}
 		if first, dup := seen[name]; dup {
 			return fmt.Errorf("gates[%d].name %q duplicates gates[%d]; each gate needs its own name", i, name, first)
 		}
@@ -123,6 +149,18 @@ func validateGates(gates []Gate) error {
 			return fmt.Errorf("gates[%d] (%q).after %q is not an anchorable core step; valid: %s", i, name, gate.After, gateAnchorText())
 		}
 
+		if gate.Kind != "" {
+			if gate.Kind != GateKindCrap {
+				return fmt.Errorf("gates[%d] (%q).kind %q is not a built-in evaluator", i, name, gate.Kind)
+			}
+			if gate.Crap == nil {
+				return fmt.Errorf("gates[%d] (%q) is a %s gate with no payload", i, name, gate.Kind)
+			}
+			if strings.TrimSpace(gate.Command) != "" {
+				return fmt.Errorf("gates[%d] (%q) must not carry both kind %q and a command", i, name, gate.Kind)
+			}
+			continue
+		}
 		if strings.TrimSpace(gate.Command) == "" {
 			return fmt.Errorf("gates[%d] (%q).command must not be empty", i, name)
 		}

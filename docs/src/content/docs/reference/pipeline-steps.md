@@ -6,7 +6,7 @@ description: Reference for each step in the validation pipeline.
 This is the per-step reference. For the overview and rationale, see [Pipeline](/no-mistakes/concepts/pipeline/). For the fix loop, see [Auto-Fix Loop](/no-mistakes/concepts/auto-fix/).
 
 ```text
-intent → rebase → review → test → document → lint → push → pr → ci
+intent → rebase → review → test → document → lint → [crap] → push → pr → ci
 ```
 
 Each step can produce findings, request approval, trigger auto-fix, or apply safe fixes during its own pass. Steps that encounter fatal errors stop the pipeline. Steps can also be pre-skipped when starting a run, skipped by the user, or skipped automatically by the pipeline.
@@ -216,6 +216,23 @@ Combined-pass lint findings use the same gate: `error` and `warning` findings pa
 When `commands.lint` is empty, unresolved findings from the combined pass pause for approval instead of starting another automatic lint/fix loop, because the agent already attempted safe fixes during housekeeping.
 
 **Default auto-fix limit:** `3`.
+
+## CRAP
+
+Scores the change's functions with the CRAP (Change Risk Anti-Patterns) metric and parks on any function whose score exceeds its language's threshold. The step exists only when the repository's [`crap`](/no-mistakes/reference/repo-config/#crap) block enables it, and runs as a built-in check immediately after `lint`.
+
+**Behavior:**
+
+- Runs after lint, so the file shape and line numbers the reports refer to are final, and before push, so nothing is published that the gate rejects
+- Reads report files the repository's tooling produced (see [`crap`](/no-mistakes/reference/repo-config/#crap) for the per-language contracts); optionally runs per-language `collect` commands first, and `crap.command` as the escape hatch
+- Computes each in-scope function's CRAP with one shared formula, applying the effective threshold per language (language block > repo-wide > language default)
+- `scope: changed` scores only functions whose lines the change touched; `scope: all` scores every function in the reports; test files and `ignore_patterns` paths are excluded unless opted in
+- With `require_fresh_reports` (default), a report older than this run's test step fails the step closed
+- Produces one `error`/`ask-user` finding per over-threshold function, carrying its complexity and coverage, and records a machine-readable report for the PR body and attestation
+
+**Approval:** over-threshold findings pause for a decision. Like a repository gate, the step never repairs on its own initiative; answering `fix` runs one agent repair round against the reported findings and re-evaluates.
+
+**Default auto-fix limit:** not used (fix is operator-authorized only).
 
 ## Push
 

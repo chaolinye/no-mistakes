@@ -346,7 +346,7 @@ func WithCustomGates(core []pipeline.Step, gates []config.Gate) []pipeline.Step 
 	}
 	anchored := make(map[types.StepName][]pipeline.Step, len(gates))
 	for _, gate := range gates {
-		anchored[gate.After] = append(anchored[gate.After], &CustomGateStep{Gate: gate})
+		anchored[gate.After] = append(anchored[gate.After], stepForGate(gate))
 	}
 	sequence := make([]pipeline.Step, 0, len(core)+len(gates))
 	for _, step := range core {
@@ -354,6 +354,18 @@ func WithCustomGates(core []pipeline.Step, gates []config.Gate) []pipeline.Step 
 		sequence = append(sequence, anchored[step.Name()]...)
 	}
 	return sequence
+}
+
+// stepForGate builds the pipeline step for one extra check: the built-in CRAP
+// evaluator for a kind-bearing gate, a shell command gate otherwise. A
+// kind-bearing gate without a payload cannot occur here - validateGates refuses
+// it at config parse and pin decode time - so the fallthrough is a command gate
+// with an empty command, which fails closed when it runs.
+func stepForGate(gate config.Gate) pipeline.Step {
+	if gate.Kind == config.GateKindCrap && gate.Crap != nil {
+		return &CrapStep{Gate: gate, Config: *gate.Crap}
+	}
+	return &CustomGateStep{Gate: gate}
 }
 
 // AllSteps returns the fixed core pipeline step sequence.

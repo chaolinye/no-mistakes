@@ -109,6 +109,12 @@ const (
 // recorded as an override rather than a silent green completion.
 const FindingCategoryTestCommand = "test-command"
 
+// FindingCategoryCrap marks the deterministic findings the built-in CRAP
+// scoring step produces: one per function whose score exceeds its language's
+// threshold. The PR renderer reads the accompanying CrapReport rather than
+// parsing these descriptions.
+const FindingCategoryCrap = "crap"
+
 // FindingIDTestAgentTimeout is the Test-step park when an evidence or repair
 // invocation burned its wall-clock budget. It is a budget/provider-slowness
 // cut, not a product defect; TestOverrideReason treats an approval of this
@@ -309,9 +315,44 @@ type Findings struct {
 	// unvalidated-work check measured from, carried so a repeated cut before any
 	// evidence turn completes re-measures from that same head.
 	UnvalidatedSinceSHA string `json:"unvalidated_since_sha,omitempty"`
-	RiskLevel           string `json:"risk_level"`
-	RiskRationale       string `json:"risk_rationale"`
-	RiskScope           string `json:"risk_scope,omitempty"`
+	// Crap is the built-in CRAP step's machine-readable report: the thresholds
+	// in force, how many functions were evaluated, and the worst entries. It is
+	// the source for the PR's Code Quality section and the attestation's crap
+	// field, so a consumer reads numbers rather than parsing prose. Nil on every
+	// other step and on runs from before the CRAP step existed.
+	Crap          *CrapReport `json:"crap,omitempty"`
+	RiskLevel     string      `json:"risk_level"`
+	RiskRationale string      `json:"risk_rationale"`
+	RiskScope     string      `json:"risk_scope,omitempty"`
+}
+
+// CrapReport is the CRAP step's structured result. It is additive: an older
+// payload without it parses as nil and renders exactly as before.
+type CrapReport struct {
+	// Thresholds is the effective per-language threshold map that was applied.
+	Thresholds map[string]float64 `json:"thresholds,omitempty"`
+	Scope      string             `json:"scope,omitempty"`
+	Evaluated  int                `json:"evaluated"`
+	// Unmeasured counts in-scope functions the reports could not measure. They
+	// are reported, never gated, and never silently dropped.
+	Unmeasured int      `json:"unmeasured"`
+	Worst      float64  `json:"worst"`
+	Languages  []string `json:"languages,omitempty"`
+	// Entries lists the evaluated functions worst-first, bounded by the step's
+	// max_findings, so the PR table and the findings carry the same numbers.
+	Entries []CrapEntry `json:"entries,omitempty"`
+}
+
+// CrapEntry is one scored function in a CrapReport.
+type CrapEntry struct {
+	File       string  `json:"file"`
+	Name       string  `json:"name,omitempty"`
+	Line       int     `json:"line,omitempty"`
+	Language   string  `json:"language,omitempty"`
+	Complexity int     `json:"complexity"`
+	Coverage   float64 `json:"coverage"`
+	Score      float64 `json:"score"`
+	Over       bool    `json:"over,omitempty"`
 }
 
 type findingsWire struct {
@@ -327,6 +368,7 @@ type findingsWire struct {
 	Verdict             string           `json:"verdict"`
 	TestedHeadSHA       string           `json:"tested_head_sha"`
 	UnvalidatedSinceSHA string           `json:"unvalidated_since_sha"`
+	Crap                *CrapReport      `json:"crap"`
 	RiskLevel           string           `json:"risk_level"`
 	RiskRationale       string           `json:"risk_rationale"`
 	RiskScope           string           `json:"risk_scope"`
@@ -355,6 +397,7 @@ func ParseFindingsJSON(raw string) (Findings, error) {
 		Verdict:             wire.Verdict,
 		TestedHeadSHA:       wire.TestedHeadSHA,
 		UnvalidatedSinceSHA: wire.UnvalidatedSinceSHA,
+		Crap:                wire.Crap,
 		RiskLevel:           wire.RiskLevel,
 		RiskRationale:       wire.RiskRationale,
 		RiskScope:           wire.RiskScope,

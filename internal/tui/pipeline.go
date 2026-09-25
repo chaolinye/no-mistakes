@@ -82,6 +82,9 @@ func runStatusStyled(status types.RunStatus) string {
 
 // stepLabel returns the human-readable label for a step name.
 func stepLabel(name types.StepName) string {
+	if types.IsBuiltinCrapStep(name) {
+		return "CRAP"
+	}
 	switch name {
 	case types.StepIntent:
 		return "Intent"

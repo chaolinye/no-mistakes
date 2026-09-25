@@ -55,6 +55,11 @@ type pipelineAttestation struct {
 	// omitted entirely for a run whose test step recorded no verdict (every
 	// run from before the contract), which is itself the answer: unknown.
 	LiveValidation *pipelineAttestationLiveValidation `json:"live_validation,omitempty"`
+	// Crap is the built-in CRAP step's machine-readable result. Like
+	// live_validation it is omitted whenever the report was measured at a head
+	// other than the one being attested, so a consumer cannot read a stale
+	// verdict as current.
+	Crap *pipelineAttestationCrap `json:"crap,omitempty"`
 	// AllowTestCommandOverride is the trusted repo-config reason that opts
 	// this repository into letting require-no-mistakes accept a Test step
 	// approved over a failing configured commands.test. Omitted when the repo
@@ -74,6 +79,18 @@ type pipelineAttestationStep struct {
 
 // pipelineAttestationLiveValidation reports the run's verdict and how much of
 // its scenario list was driven against the real product.
+// pipelineAttestationCrap reports whether this change was CRAP-gated and how
+// bad the worst function was. It is data only: whether the numbers constitute a
+// pass is the consumer's policy, exactly like the step list.
+type pipelineAttestationCrap struct {
+	Thresholds map[string]float64 `json:"thresholds,omitempty"`
+	Scope      string             `json:"scope,omitempty"`
+	Evaluated  int                `json:"evaluated"`
+	Unmeasured int                `json:"unmeasured"`
+	Worst      float64            `json:"worst"`
+	Languages  []string           `json:"languages,omitempty"`
+}
+
 type pipelineAttestationLiveValidation struct {
 	Verdict string `json:"verdict"`
 	Live    int    `json:"live"`
@@ -148,6 +165,10 @@ func buildPipelineSummaryFor(steps []*db.StepResult, rounds map[string][]*db.Ste
 			// emitted separately by buildPipelineAttestation and is untouched.
 			detailBlocks = append(detailBlocks, neutralizeAttestationMarkers(detail))
 		}
+	}
+
+	if crapSection := renderCrapSectionFor(steps, rounds, headSHA); crapSection != "" {
+		detailBlocks = append(detailBlocks, crapSection)
 	}
 
 	if len(detailBlocks) == 0 {
@@ -227,6 +248,7 @@ func newPipelineAttestation(steps []*db.StepResult, rounds map[string][]*db.Step
 		return false
 	})
 	attestation.LiveValidation = attestedLiveValidation(steps, rounds, headSHA)
+	attestation.Crap = attestedCrap(steps, rounds, headSHA)
 	return attestation
 }
 
@@ -1727,6 +1749,9 @@ func severityEmoji(severity string) string {
 }
 
 func stepDisplayName(name types.StepName) string {
+	if isCrapGateStep(name) {
+		return "CRAP"
+	}
 	switch name {
 	case types.StepRebase:
 		return "Rebase"
@@ -1747,4 +1772,9 @@ func stepDisplayName(name types.StepName) string {
 	default:
 		return string(name)
 	}
+}
+
+// isCrapGateStep reports whether name is the built-in CRAP gate.
+func isCrapGateStep(name types.StepName) bool {
+	return types.IsBuiltinCrapStep(name)
 }

@@ -6,12 +6,12 @@ description: The nine steps that run on every gated push.
 The pipeline has a fixed, opinionated sequence of nine core steps. Their order is not configurable. What each core step runs is.
 
 ```
-intent → rebase → review → test → document → lint → push → pr → ci
+intent → rebase → review → test → document → lint → [crap] → push → pr → ci
 ```
 
 ```mermaid
 flowchart LR
-  intent["Intent"] --> rebase["Rebase"] --> review["Review"] --> test["Test"] --> document["Document"] --> lint["Lint"] --> push["Push"] --> pr["PR"] --> ci["CI"]
+  intent["Intent"] --> rebase["Rebase"] --> review["Review"] --> test["Test"] --> document["Document"] --> lint["Lint"] --> crap["CRAP"] --> push["Push"] --> pr["PR"] --> ci["CI"]
   review -. findings .-> action["Approve / fix / skip / abort"]
   test -. findings .-> action
   document -. findings .-> action
@@ -44,9 +44,10 @@ The pipeline is opinionated so that "passed the gate" has a stable meaning:
 | 4 | **Test** | Targeted local validation of the change and intent (not a full CI suite), plus evidence when intent is available | `3` |
 | 5 | **Document** | Update docs when needed and report unresolved gaps | initial pass |
 | 6 | **Lint** | Run lint/static analysis; shares the document step's initial housekeeping pass when no lint command is configured | `3` |
-| 7 | **Push** | Safely push the validated branch to the configured target | n/a |
-| 8 | **PR** | Create or update the pull request | n/a |
-| 9 | **CI** | Watch CI + mergeability, auto-fix failures | `3` |
+| 7 | **CRAP** | Score the change's functions with the CRAP metric and park on any over-threshold function; exists only when the repository enables `crap:` | n/a |
+| 8 | **Push** | Safely push the validated branch to the configured target | n/a |
+| 9 | **PR** | Create or update the pull request | n/a |
+| 10 | **CI** | Watch CI + mergeability, auto-fix failures | `3` |
 
 ## Why these steps, in this order
 

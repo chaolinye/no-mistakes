@@ -172,6 +172,25 @@ const (
 // and the attestation payload.
 const MaxCustomGateLabelLen = 40
 
+// BuiltinCrapGateLabel is the reserved gate label of the built-in CRAP scoring
+// step. types owns it because the derived step name is what the TUI, the PR
+// renderer, the attestation, and the run pin all key on.
+const BuiltinCrapGateLabel = "crap"
+
+// IsBuiltinCrapStep reports whether name is the built-in CRAP step: a
+// well-formed gate name carrying the reserved label. It is the single owner of
+// that identity, so the display surfaces and the config that mints the step
+// cannot drift apart.
+func IsBuiltinCrapStep(name StepName) bool {
+	if !name.IsCustomGate() {
+		return false
+	}
+	if _, ok := name.CustomGateAnchor(); !ok {
+		return false
+	}
+	return name.CustomGateLabel() == BuiltinCrapGateLabel
+}
+
 // ValidCustomGateLabel reports whether label is a well-formed gate label:
 // non-empty, at most MaxCustomGateLabelLen bytes, and lowercase letters,
 // digits, and inner hyphens only.

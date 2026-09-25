@@ -322,6 +322,15 @@ type RepoConfig struct {
 	// re-run that branch's own suite, a gate defines what validating the branch
 	// MEANS, and a contributor must not author the check that clears them.
 	Gates []Gate `yaml:"gates"`
+	// Crap configures the CRAP (change-risk) scoring step. It reads report
+	// files, may run per-language collect commands, and its threshold decides
+	// whether the run parks, so it is honored ONLY from the trusted
+	// default-branch copy of .no-mistakes.yaml (see EffectiveRepoConfig),
+	// regardless of allow_repo_commands, for exactly the reasons gates and
+	// commands.* are: a contributor must not be able to raise their own
+	// threshold, aim a report path at an empty file, or inject the command that
+	// clears them.
+	Crap CrapRaw `yaml:"crap"`
 	// DisableProjectSettings opts the repository out of loading project-level
 	// agent settings/instructions (AGENTS.md/CLAUDE.md and the equivalent
 	// per-harness project settings) into gate agents. It exists for
@@ -504,6 +513,7 @@ func (c *RepoConfig) UnmarshalYAML(value *yaml.Node) error {
 		Document               DocumentRaw  `yaml:"document"`
 		Review                 ReviewRaw    `yaml:"review"`
 		Gates                  []Gate       `yaml:"gates"`
+		Crap                   CrapRaw      `yaml:"crap"`
 		DisableProjectSettings bool         `yaml:"disable_project_settings"`
 		NoCI                   bool         `yaml:"no_ci"`
 		Providers              ProvidersRaw `yaml:"providers"`
@@ -528,6 +538,7 @@ func (c *RepoConfig) UnmarshalYAML(value *yaml.Node) error {
 	c.Document = raw.Document
 	c.Review = raw.Review
 	c.Gates = raw.Gates
+	c.Crap = raw.Crap
 	c.DisableProjectSettings = raw.DisableProjectSettings
 	c.NoCI = raw.NoCI
 	c.Providers = raw.Providers
@@ -676,7 +687,11 @@ type Config struct {
 	// Gates are the repository's extra checks, already trusted-only by the
 	// time they reach here (EffectiveRepoConfig sourced them from the trusted
 	// default-branch copy).
-	Gates          []Gate
+	Gates []Gate
+	// Crap is the resolved CRAP-step configuration, already trusted-only by
+	// the time it reaches here (EffectiveRepoConfig sourced it from the
+	// trusted default-branch copy).
+	Crap           Crap
 	IgnorePatterns []string
 	ProtectedPaths []string
 	AutoFix        AutoFix
@@ -2401,6 +2416,9 @@ func parseRepoConfig(data []byte) (*RepoConfig, error) {
 	if err := validateGates(cfg.Gates); err != nil {
 		return nil, fmt.Errorf("parse repo config: %w", err)
 	}
+	if err := validateCrapRaw(cfg.Crap); err != nil {
+		return nil, fmt.Errorf("parse repo config: %w", err)
+	}
 	if err := validateRebaseRaw(cfg.Rebase); err != nil {
 		return nil, fmt.Errorf("parse repo config: %w", err)
 	}
@@ -2559,6 +2577,13 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 		// branch re-running its own suite, never a branch authoring the extra
 		// check that clears it.
 		effective.Gates = copyGates(trusted.Gates)
+		// crap.* reads report files, may execute per-language collect commands,
+		// and its thresholds decide whether the run parks. It is trusted-only
+		// for exactly the reasons gates are, and likewise regardless of
+		// allow_repo_commands: a contributor must not be able to raise their own
+		// CRAP threshold, aim a report path at an empty file, or supply the
+		// command that clears them.
+		effective.Crap = trusted.Crap
 		// disable_project_settings is a security boundary: honor it ONLY from the
 		// trusted default-branch copy so a pushed branch cannot turn the opt-out
 		// off (and re-enable its own AGENTS.md) or on. A nil trusted copy here
@@ -2622,6 +2647,7 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 		effective.ProtectedPaths = nil
 		effective.Review = ReviewRaw{}
 		effective.Gates = nil
+		effective.Crap = CrapRaw{}
 		effective.DisableProjectSettings = false
 		effective.NoCI = false
 		effective.CI = CIRaw{}
@@ -3106,7 +3132,8 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		// Jev is global-only for the same reason as Eval.
 		Jev:            global.Jev,
 		Commands:       repo.Commands,
-		Gates:          copyGates(repo.Gates),
+		Gates:          CrapGates(repo.Crap, repo.Gates),
+		Crap:           ResolveCrap(repo.Crap),
 		IgnorePatterns: repo.IgnorePatterns,
 		ProtectedPaths: repo.ProtectedPaths,
 		AutoFix:        af,
