@@ -446,6 +446,48 @@ func TestDefaultBranchEmptyRemote(t *testing.T) {
 	}
 }
 
+func TestLocalDefaultBranch(t *testing.T) {
+	ctx := context.Background()
+
+	// Fresh repo with no remote: reports the checked-out branch.
+	src := initTestRepo(t)
+	current := run(t, src, "git", "rev-parse", "--abbrev-ref", "HEAD")
+	if got := LocalDefaultBranch(ctx, src); got != current {
+		t.Fatalf("LocalDefaultBranch = %q, want checked-out branch %q", got, current)
+	}
+
+	// A checked-out feature branch is the best local proxy for the default.
+	run(t, src, "git", "checkout", "-b", "feature")
+	if got := LocalDefaultBranch(ctx, src); got != "feature" {
+		t.Fatalf("LocalDefaultBranch on feature = %q, want %q", got, "feature")
+	}
+}
+
+func TestLocalDefaultBranchPrefersOriginHEAD(t *testing.T) {
+	ctx := context.Background()
+	src := initTestRepo(t)
+
+	// A repo that once had an origin remote keeps refs/remotes/origin/HEAD.
+	// Even when a feature branch is checked out, the recorded origin default
+	// wins over the current branch.
+	run(t, src, "git", "checkout", "-b", "feature")
+	run(t, src, "git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+	if got := LocalDefaultBranch(ctx, src); got != "main" {
+		t.Fatalf("LocalDefaultBranch = %q, want origin/HEAD default %q", got, "main")
+	}
+}
+
+func TestLocalDefaultBranchFallback(t *testing.T) {
+	ctx := context.Background()
+	// A detached HEAD with no origin/HEAD has no default branch to name;
+	// falls back to "main".
+	src := initTestRepo(t)
+	run(t, src, "git", "checkout", "--detach")
+	if got := LocalDefaultBranch(ctx, src); got != "main" {
+		t.Fatalf("LocalDefaultBranch(detached) = %q, want %q", got, "main")
+	}
+}
+
 func TestCurrentBranch(t *testing.T) {
 	dir := initTestRepo(t)
 	ctx := context.Background()

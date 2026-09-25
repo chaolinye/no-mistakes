@@ -163,7 +163,16 @@ func normalizedBranchRef(ref string) string {
 //
 // This separation lets the database and logs store a redacted URL while the
 // credential still reaches the git push/ls-remote argv that needs it.
+//
+// A local-only repository has no origin remote or registered URL: its only
+// "upstream" is the operator's own working repo, so the fetch/ls-remote
+// operations that rebase and trusted-config reads run against it source from
+// the working path. Git treats a local path as a valid fetch/ls-remote target,
+// so the pipeline machinery is unchanged.
 func resolveUpstreamURL(sctx *pipeline.StepContext) string {
+	if sctx != nil && sctx.Repo != nil && sctx.Repo.IsLocal() {
+		return strings.TrimSpace(sctx.Repo.WorkingPath)
+	}
 	if url, err := git.GetRemoteURL(sctx.Ctx, sctx.WorkDir, "origin"); err == nil && strings.TrimSpace(url) != "" {
 		// A matching redacted value means origin may carry credentials that the
 		// database intentionally omits. A different registration was refreshed

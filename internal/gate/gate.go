@@ -94,20 +94,29 @@ func InitWithFork(ctx context.Context, d *db.DB, p *paths.Paths, workDir, forkUR
 	}
 	upstreamURL, err := getOriginURL(ctx, absRoot, "origin")
 	if err != nil {
-		// A missing "origin" is a normal state for a fresh `git init` repo, so
-		// give an actionable message instead of leaking git plumbing. Only
-		// substitute it when origin is genuinely absent; any other git failure
-		// keeps its original error.
+		// A missing "origin" is a normal state for a fresh `git init` repo.
+		// For a fork-init the caller passed an explicit fork URL, which needs
+		// an origin to open PRs against, so that still fails. Otherwise the
+		// repo is local-only: no remote to push to or open a pull request
+		// against, so the delivery tail is skipped and the validation
+		// pipeline sources its "upstream" from the operator's own working
+		// repo. Only substitute the message when origin is genuinely absent;
+		// any other git failure keeps its original error.
 		hasOrigin, listErr := git.HasRemote(ctx, absRoot, "origin")
 		if listErr == nil && !hasOrigin {
-			return nil, false, fmt.Errorf(
-				"no 'origin' remote in %s\n\n"+
-					"no-mistakes pushes your branch and opens a pull request, so it needs a remote to push to.\n"+
-					"Add one, then re-run:\n\n"+
-					"  git remote add origin <url>",
-				absRoot)
+			if forkURL != "" {
+				return nil, false, fmt.Errorf(
+					"no 'origin' remote in %s\n\n"+
+						"no-mistakes opens pull requests against origin, so --fork-url requires an origin remote.\n"+
+						"Add one, then re-run:\n\n"+
+						"  git remote add origin <url>",
+					absRoot)
+			}
+			slog.Info("gate initialized for local-only repository (no origin remote); push/pr/ci steps will be skipped", "path", absRoot)
+			upstreamURL = ""
+		} else {
+			return nil, false, fmt.Errorf("get origin url: %w", err)
 		}
-		return nil, false, fmt.Errorf("get origin url: %w", err)
 	}
 	if forkURL != "" {
 		if err := validateForkRouting(ctx, upstreamURL, forkURL); err != nil {
@@ -141,8 +150,14 @@ func InitWithFork(ctx context.Context, d *db.DB, p *paths.Paths, workDir, forkUR
 		return nil, false, err
 	}
 
-	// Detect default branch from upstream remote.
-	branch := git.DefaultBranch(ctx, absRoot, "origin")
+	// Detect default branch: from the upstream remote when one exists,
+	// otherwise from the local repo itself (the local-only case).
+	branch := ""
+	if strings.TrimSpace(upstreamURL) != "" {
+		branch = git.DefaultBranch(ctx, absRoot, "origin")
+	} else {
+		branch = git.LocalDefaultBranch(ctx, absRoot)
+	}
 
 	if existing != nil {
 		var repo *db.Repo
@@ -214,9 +229,13 @@ func provisionGate(ctx context.Context, bareDir, absRoot, upstreamURL, reposDir 
 	}
 
 	// Record upstream as origin on the gate repo so gh can resolve repository
-	// context from detached worktrees created from the gate.
-	if err := git.EnsureRemote(ctx, bareDir, "origin", upstreamURL); err != nil {
-		return fmt.Errorf("add gate origin remote: %w", err)
+	// context from detached worktrees created from the gate. A local-only repo
+	// has no upstream: the gate keeps no origin remote at all, and the run
+	// worktrees source their "upstream" from the operator's working repo.
+	if strings.TrimSpace(upstreamURL) != "" {
+		if err := git.EnsureRemote(ctx, bareDir, "origin", upstreamURL); err != nil {
+			return fmt.Errorf("add gate origin remote: %w", err)
+		}
 	}
 
 	if err := ensureWorkingRemote(ctx, absRoot, bareDir, reposDir, refresh); err != nil {

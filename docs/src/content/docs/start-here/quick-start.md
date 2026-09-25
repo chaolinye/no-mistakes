@@ -34,13 +34,15 @@ See [Provider Integration](/no-mistakes/guides/provider-integration/) for PR/CI 
 
 ## 3. Initialize a repo
 
-Navigate to any git repo with an `origin` remote:
+Navigate to any git repo:
 
 ```sh
 no-mistakes init
 ```
 
 This creates or refreshes a local bare repo at `~/.no-mistakes/repos/<id>.git`, installs managed pre- and post-receive hooks, best-effort isolates the gate's hooks path from shared local Git config writes when Git supports `config --worktree`, adds or repairs a `no-mistakes` git remote in your working repo, installs the `/no-mistakes` agent skill, and ensures the daemon is running.
+
+A repo with an `origin` remote gets the full pipeline: rebase against fresh upstream, review, test, document, lint, then push and open a PR. A **local-only repo** (no `origin`) also works: the validation pipeline runs against your own default branch, and the `push`, `pr`, and `ci` steps are skipped because there is nowhere to push or open a pull request. See [Local-only repositories](/no-mistakes/concepts/gate-model/#local-only-repositories) for details.
 
 For GitHub fork contributions, keep `origin` pointed at the parent repository and pass your fork as the push target:
 

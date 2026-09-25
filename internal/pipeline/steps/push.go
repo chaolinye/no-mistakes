@@ -24,6 +24,16 @@ type PushStep struct{}
 func (s *PushStep) Name() types.StepName { return types.StepPush }
 
 func (s *PushStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
+	// A local-only repository has nowhere to push: no remote, no fork, and no
+	// gate mirror to settle against an upstream. The daemon already skips this
+	// step at run creation (effectiveSkipSteps), but the step refuses to run
+	// on its own too so no path - explicit IPC, a revalidation reset, or a
+	// future caller - can attempt a push into the operator's working repo
+	// (resolveUpstreamURL returns its path for local repos).
+	if sctx.Repo != nil && sctx.Repo.IsLocal() {
+		sctx.Log("local-only repository: no remote to push to, skipping push")
+		return &pipeline.StepOutcome{Skipped: true, SkipReason: "local-only repository has no remote to push to"}, nil
+	}
 	if err := assertPipelineHeadContinuity(sctx, s.Name()); err != nil {
 		return nil, err
 	}

@@ -503,6 +503,25 @@ func DefaultBranch(ctx context.Context, dir, remote string) string {
 	return "main"
 }
 
+// LocalDefaultBranch returns the repository's own default branch name without
+// consulting any remote. It prefers a leftover origin HEAD symref (a repo that
+// once had an origin remote), then the currently checked-out branch as the
+// best local proxy, and falls back to "main". It exists for local-only
+// repositories where ls-remote has no remote to ask.
+func LocalDefaultBranch(ctx context.Context, dir string) string {
+	if out, err := Run(ctx, dir, "symbolic-ref", "-q", "refs/remotes/origin/HEAD"); err == nil {
+		if branch := strings.TrimPrefix(strings.TrimSpace(out), "refs/remotes/origin/"); branch != "" && branch != out {
+			return branch
+		}
+	}
+	if out, err := Run(ctx, dir, "symbolic-ref", "-q", "HEAD"); err == nil {
+		if branch := strings.TrimPrefix(strings.TrimSpace(out), "refs/heads/"); branch != "" && branch != out {
+			return branch
+		}
+	}
+	return "main"
+}
+
 // FetchRemoteBranch fetches a single branch into a remote-tracking ref.
 // Uses a force-update refspec (+) so non-fast-forward updates (e.g. after
 // a force push on the remote) are accepted instead of silently rejected.

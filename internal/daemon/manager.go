@@ -228,8 +228,14 @@ func (m *RunManager) loadRecoveredConfig(ctx context.Context, run *db.Run, repo 
 	if repo.DefaultBranch != "" {
 		fetchCtx, cancel := context.WithTimeout(ctx, recoveredConfigFetchTimeout)
 		defer cancel()
-		if err := fetchRecoveredRemoteBranch(fetchCtx, workDir, "origin", repo.DefaultBranch); err != nil {
-			slog.Warn("failed to fetch default branch while recovering run; trusted config disabled", "run_id", run.ID, "branch", repo.DefaultBranch, "error", err)
+		var fetchErr error
+		if repo.IsLocal() {
+			fetchErr = git.FetchRemoteBranchToRef(fetchCtx, workDir, repo.WorkingPath, repo.DefaultBranch, "refs/remotes/origin/"+repo.DefaultBranch)
+		} else {
+			fetchErr = fetchRecoveredRemoteBranch(fetchCtx, workDir, "origin", repo.DefaultBranch)
+		}
+		if fetchErr != nil {
+			slog.Warn("failed to fetch default branch while recovering run; trusted config disabled", "run_id", run.ID, "branch", repo.DefaultBranch, "error", fetchErr)
 		} else if sha, err := git.ResolveRef(ctx, workDir, "refs/remotes/origin/"+repo.DefaultBranch); err != nil {
 			slog.Warn("failed to resolve default branch while recovering run; trusted config disabled", "run_id", run.ID, "branch", repo.DefaultBranch, "error", err)
 		} else {
@@ -1180,13 +1186,49 @@ func resolveRerunHead(ctx context.Context, gateDir, branch string, latest *db.Ru
 	return "", fmt.Errorf("refusing rerun from stale gate head %s: terminal run %s recorded unpublished head %s, but that head is unavailable; inspect with `no-mistakes axi status` and reconcile custody first", gateHead, latest.ID, latest.HeadSHA)
 }
 
+// effectiveSkipSteps unions the operator-requested skip list with the steps a
+// local-only repository can never run. A local-only repo has no remote to push
+// to, no forge to open a pull request on, and no PR head for CI to watch, so
+// push/pr/ci are always skipped regardless of what the caller asked for. This
+// is applied once at run creation; crash recovery resumes the recorded step
+// states (these steps were already marked skipped), so it never needs to run
+// again.
+func effectiveSkipSteps(repo *db.Repo, skipSteps []types.StepName) []types.StepName {
+	if repo == nil || !repo.IsLocal() {
+		return skipSteps
+	}
+	has := func(step types.StepName) bool {
+		for _, s := range skipSteps {
+			if s == step {
+				return true
+			}
+		}
+		return false
+	}
+	for _, step := range []types.StepName{types.StepPush, types.StepPR, types.StepCI} {
+		if !has(step) {
+			skipSteps = append(skipSteps, step)
+		}
+	}
+	return skipSteps
+}
+
 // fetchRunDefaultBranch fetches the trusted branch from the refreshed
 // registration when it differs from the gate worktree's inherited origin. It
 // updates only the run worktree's existing origin tracking ref and never
 // rewrites clone or gate remote configuration. When the values agree after
 // redaction, origin remains authoritative so embedded credentials retained in
 // the gate can still authenticate without ever entering the database.
+//
+// A local-only repository has no origin remote at all: its trusted branch is
+// the operator's own working-repo default branch, fetched from the working
+// path the same way a network remote would be (git fetch from a local path is
+// a plain object transfer). The fetched ref still lands in refs/remotes/origin
+// so the pinned-SHA trusted-config read stays uniform with remote repos.
 func fetchRunDefaultBranch(ctx context.Context, workDir string, repo *db.Repo) error {
+	if repo.IsLocal() {
+		return git.FetchRemoteBranchToRef(ctx, workDir, repo.WorkingPath, repo.DefaultBranch, "refs/remotes/origin/"+repo.DefaultBranch)
+	}
 	originURL, err := git.GetRemoteURL(ctx, workDir, "origin")
 	if !repo.URLsVerified || (err == nil && safeurl.Redact(originURL) == repo.UpstreamURL) {
 		return git.FetchRemoteBranch(ctx, workDir, "origin", repo.DefaultBranch)
@@ -1208,7 +1250,9 @@ func fetchTrustedDefaultBranchSHA(ctx context.Context, gateDir string, repo *db.
 	}()
 	originURL, err := git.GetRemoteURL(ctx, gateDir, "origin")
 	var fetchErr error
-	if !repo.URLsVerified || (err == nil && safeurl.Redact(originURL) == repo.UpstreamURL) {
+	if repo.IsLocal() {
+		fetchErr = git.FetchRemoteBranchToPrivateRef(ctx, gateDir, repo.WorkingPath, repo.DefaultBranch, privateRef)
+	} else if !repo.URLsVerified || (err == nil && safeurl.Redact(originURL) == repo.UpstreamURL) {
 		fetchErr = git.FetchRemoteBranchToPrivateRef(ctx, gateDir, "origin", repo.DefaultBranch, privateRef)
 	} else {
 		fetchErr = git.FetchRemoteBranchToPrivateRef(ctx, gateDir, repo.UpstreamURL, repo.DefaultBranch, privateRef)
@@ -1573,7 +1617,7 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 	runCtx, cancel := context.WithCancelCause(context.Background())
 	executor := pipeline.NewExecutor(m.db, m.paths, cfg, ag, execSteps, m.broadcast)
 	executor.SetForgeContext(forgeCtx)
-	executor.SetSkippedSteps(skipSteps)
+	executor.SetSkippedSteps(effectiveSkipSteps(repo, skipSteps))
 	executor.SetOnPRMerged(func(_ context.Context, runID string) {
 		m.wg.Add(1)
 		go func() {

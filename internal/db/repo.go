@@ -31,6 +31,18 @@ func (r *Repo) PushURL() string {
 	return r.UpstreamURL
 }
 
+// IsLocal reports whether this repository is local-only: it has no upstream
+// and no fork remote, so there is nowhere to push a branch or open a pull
+// request. Local-only repositories run the validation pipeline (rebase,
+// review, test, document, lint) against the operator's own default branch and
+// skip the delivery tail (push, pr, ci).
+func (r *Repo) IsLocal() bool {
+	if r == nil {
+		return false
+	}
+	return strings.TrimSpace(r.UpstreamURL) == "" && strings.TrimSpace(r.ForkURL) == ""
+}
+
 // InsertRepoWithID creates a new repo record with a caller-provided ID.
 func (d *DB) InsertRepoWithID(id, workingPath, upstreamURL, defaultBranch string) (*Repo, error) {
 	return d.InsertRepoWithIDAndFork(id, workingPath, upstreamURL, "", defaultBranch)
