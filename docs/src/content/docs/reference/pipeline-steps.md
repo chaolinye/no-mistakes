@@ -238,6 +238,8 @@ Pre-skipping or later skipping Review leaves no approval binding, so Push fails 
 
 This step never requires approval - it runs automatically after review, test, document, and lint pass.
 
+**Local-only repositories:** on a repo with no `origin` remote there is no push target, so this step is always skipped (both by the daemon at run creation and by the step itself). No remote, fork, or gate-mirror mutation occurs.
+
 ## PR
 
 Creates or updates a pull request.
@@ -250,6 +252,7 @@ Creates or updates a pull request.
 - Bitbucket Cloud credentials are missing (`NO_MISTAKES_BITBUCKET_EMAIL` or `NO_MISTAKES_BITBUCKET_API_TOKEN`)
 - The `az` CLI with the `azure-devops` extension is not installed or not authenticated for Azure DevOps
 - A legacy or manually edited non-GitHub repo record has `fork_url` set, because fork MR/PR routing is currently GitHub-only
+- The repository is local-only (no `origin` remote): there is no forge to open a pull request on
 
 **Behavior:**
 - Checks for an existing PR on the branch, matching by branch alone rather than filtering by base, so a still-open PR against a since-changed [`pr.base_branch`](/no-mistakes/reference/repo-config/#prbase_branch) is found and updated instead of orphaned behind a duplicate
@@ -309,6 +312,8 @@ The comment is intentionally data only. It does not declare any step required, p
 ## CI
 
 Monitors PR health after creation and auto-fixes CI failures. Mergeability polling and merge-conflict handling apply to GitHub, GitLab, Forgejo, and Azure DevOps.
+
+**Skipped for local-only repositories:** a local-only repo (no `origin`) never has a PR for CI to watch, so the CI step is always skipped - both by the daemon at run creation and by the step itself. There is no forge host, no PR URL, and no check to monitor.
 
 **Active for GitHub, GitLab, Forgejo, Bitbucket Cloud (`bitbucket.org`), Azure DevOps (`dev.azure.com` / `*.visualstudio.com`), and Gitea**.
 

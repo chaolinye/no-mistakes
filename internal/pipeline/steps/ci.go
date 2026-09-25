@@ -298,6 +298,15 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	// A local-only repository has no PR head for CI to watch: the PR step was
+	// skipped, there is no forge host, and no PR URL exists. The daemon already
+	// skips this step at run creation (effectiveSkipSteps); this guards any
+	// path that reaches the step anyway with a clear reason instead of the
+	// generic provider-unknown message.
+	if sctx.Repo != nil && sctx.Repo.IsLocal() {
+		sctx.Log("local-only repository: no pull request for CI to watch, skipping CI")
+		return &pipeline.StepOutcome{Skipped: true, SkipReason: "local-only repository has no pull request for CI to watch"}, nil
+	}
 	provider := resolvedProvider(sctx)
 	host, skipReason := buildHost(sctx, provider)
 	if host == nil {

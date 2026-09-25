@@ -69,6 +69,8 @@ When a branch passes the gate, it means:
 - review, tests, user-facing test evidence when available, docs, and lint happened before the branch reached the configured push target
 - you had a chance to approve, fix, skip, or abort any blocking step
 
+In a [local-only repository](/no-mistakes/concepts/gate-model/#local-only-repositories) (no `origin` remote), the same pipeline runs against your own default branch, and the `push`, `pr`, and `ci` steps are skipped - there is nowhere to push or open a pull request. The validation half is identical.
+
 ## What you get
 
 - A fixed, opinionated core pipeline: `intent → rebase → review → test → document → lint → push → pr → ci`. Repositories can add [command gates](/no-mistakes/reference/repo-config/#gates) after selected core steps, but cannot remove or reorder those steps.

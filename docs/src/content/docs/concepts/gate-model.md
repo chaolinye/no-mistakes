@@ -75,6 +75,18 @@ That is a core design choice, not an implementation detail.
 - **Fixed pipeline** - the step order is opinionated and not configurable: `intent → rebase → review → test → document → lint → push → pr → ci`. What you _can_ configure is the commands each step runs, how many auto-fix attempts are allowed, whether transcript-based intent extraction is used when intent is not supplied directly, and extra [`gates`](/no-mistakes/reference/repo-config/#gates) that run after a core step - additions only, never a removal or a reordering.
 - **Remote data-loss guard** - force-pushes are checked against the live push target and refused when they would discard commits the run did not incorporate.
 
+## Local-only repositories
+
+A repository without an `origin` remote is fully supported as a **local-only** repo. `no-mistakes init` does not require an origin: when it is absent, the repo is registered with no upstream URL, the gate keeps no `origin` remote, and the repository's own checked-out default branch becomes the trusted integration base.
+
+For a local-only repo, the pipeline is:
+
+- The **rebase** step fetches the working repo's default branch into the run worktree's `origin/<default>` tracking ref (a plain `git fetch` from a local path) and rebases the branch onto it, exactly as it would against a network remote.
+- The trusted default-branch config (`commands.*`, `agent`, `gates`, `no_ci`, and the rest of the trusted-only surface) is read from the operator's own default branch at a pinned SHA, preserving the same fail-closed trusted-config model. There is no contributor boundary on a local repo - the operator owns the checkout - so the local default branch is the trusted source.
+- The **push**, **pr**, and **ci** steps are always skipped: there is nowhere to push a branch, no forge to open a pull request on, and no PR head for CI to watch. The steps also refuse to run on their own if reached by any path.
+
+Everything else - `intent`, `review`, `test`, `document`, `lint`, approvals, auto-fix, custody - behaves exactly as it does for a remote-backed repo. You opt in the same way: commit your work, push it to the `no-mistakes` remote, and the local gate takes it from there.
+
 ## Why it is built this way
 
 ### Named remote

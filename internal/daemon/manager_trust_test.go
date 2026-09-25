@@ -50,7 +50,7 @@ func TestLoadRecoveredConfig_BoundsFetchAndFailsClosed(t *testing.T) {
 	// disable_project_settings security boundary a trusted-config fetch failure
 	// must ABORT (not silently proceed as "not opted out"), so this now returns
 	// an error rather than a config with empty commands.
-	_, err := mgr.loadRecoveredConfig(context.Background(), &db.Run{ID: "run"}, &db.Repo{DefaultBranch: "main"}, workDir)
+	_, err := mgr.loadRecoveredConfig(context.Background(), &db.Run{ID: "run"}, &db.Repo{WorkingPath: workDir, UpstreamURL: "https://github.com/test/repo.git", DefaultBranch: "main"}, workDir)
 	if err == nil {
 		t.Fatal("expected loadRecoveredConfig to abort on trusted-config fetch failure")
 	}

@@ -33,7 +33,8 @@ func newInitCmd() *cobra.Command {
 		Long: "Sets up or refreshes a local bare repo as a gate, installs a post-receive hook,\n" +
 			"best-effort isolates the gate hook path from shared local git config writes when Git supports `config --worktree`,\n" +
 			"adds or repairs the \"no-mistakes\" git remote, and records the repo in the database.\n\n" +
-			"Run this from inside a git repository that has an \"origin\" remote.",
+			"Run this from inside a git repository. A repo with an \"origin\" remote gets the full pipeline;\n" +
+			"a local-only repo (no origin) runs the validation steps and skips push, pr, and ci.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return trackCommand("init", func() error {
@@ -91,7 +92,11 @@ func newInitCmd() *cobra.Command {
 				if repo.ForkURL != "" {
 					remoteURL = safeurl.Redact(remoteURL)
 				}
-				fmt.Fprintf(w, "  %s  %s\n", sDim.Render("remote"), remoteURL)
+				if repo.IsLocal() {
+					fmt.Fprintf(w, "  %s  %s\n", sDim.Render("remote"), sYellow.Render("none (local-only repo; push/pr/ci will be skipped)"))
+				} else {
+					fmt.Fprintf(w, "  %s  %s\n", sDim.Render("remote"), remoteURL)
+				}
 				if repo.ForkURL != "" {
 					fmt.Fprintf(w, "  %s  %s\n", sDim.Render("  fork"), safeurl.Redact(repo.ForkURL))
 				}

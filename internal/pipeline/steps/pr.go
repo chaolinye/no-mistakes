@@ -80,6 +80,10 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 		sctx.Log(fmt.Sprintf("skipping PR creation on base branch %s", branch))
 		return &pipeline.StepOutcome{Skipped: true}, nil
 	}
+	if sctx.Repo != nil && sctx.Repo.IsLocal() {
+		sctx.Log("local-only repository: no forge to open a pull request on, skipping PR")
+		return &pipeline.StepOutcome{Skipped: true, SkipReason: "local-only repository has no forge to open a pull request on"}, nil
+	}
 	provider := resolvedProvider(sctx)
 	host, skipReason := buildHost(sctx, provider)
 	if host == nil {

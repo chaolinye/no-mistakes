@@ -49,6 +49,29 @@ func TestPRStep_GhNotAvailable(t *testing.T) {
 	}
 }
 
+func TestPRStep_LocalOnlyRepoSkips(t *testing.T) {
+	t.Parallel()
+	// A local-only repository has no forge, so the PR step must skip with a
+	// clear reason before any host construction.
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	ag := &mockAgent{name: "test"}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Repo.UpstreamURL = ""
+	sctx.Repo.ForkURL = ""
+
+	step := &PRStep{}
+	outcome, err := step.Execute(sctx)
+	if err != nil {
+		t.Fatalf("expected skip on local-only repo, got: %v", err)
+	}
+	if outcome == nil || !outcome.Skipped {
+		t.Fatalf("expected skipped outcome, got %+v", outcome)
+	}
+	if !strings.Contains(outcome.SkipReason, "local-only") {
+		t.Errorf("expected local-only skip reason, got %q", outcome.SkipReason)
+	}
+}
+
 func TestPRStep_UpdatesExistingPR(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)

@@ -834,6 +834,51 @@ func TestInitRefreshPreservesCustomPostReceiveHook(t *testing.T) {
 func TestInitNoOrigin(t *testing.T) {
 	// Create a repo without origin.
 	work := filepath.Join(resolveSymlinks(t, t.TempDir()), "work")
+	if out, err := exec.Command("git", "init", "-b", "main", work).CombinedOutput(); err != nil {
+		t.Fatalf("init: %v: %s", err, out)
+	}
+
+	nmRoot := t.TempDir()
+	p := paths.WithRoot(nmRoot)
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatalf("ensure dirs: %v", err)
+	}
+	d := openTestDB(t, p)
+
+	repo, created, err := Init(context.Background(), d, p, work)
+	if err != nil {
+		t.Fatalf("init local-only repo: %v", err)
+	}
+	if !created {
+		t.Fatal("expected a new gate for a fresh local-only repo")
+	}
+	// A local-only repo records no upstream URL and keeps its own default
+	// branch as the trusted integration base.
+	if !repo.IsLocal() {
+		t.Errorf("repo should be local-only (no upstream, no fork); got upstream=%q fork=%q", repo.UpstreamURL, repo.ForkURL)
+	}
+	if repo.DefaultBranch != "main" {
+		t.Errorf("local-only default branch = %q, want %q", repo.DefaultBranch, "main")
+	}
+	// The working repo must have gained the no-mistakes remote pointing at the
+	// gate, and the gate must NOT carry an origin remote (there is nothing to
+	// point it at).
+	nmURL, err := gitpkg.GetRemoteURL(context.Background(), work, "no-mistakes")
+	if err != nil {
+		t.Fatalf("no-mistakes remote missing after local init: %v", err)
+	}
+	if nmURL != p.RepoDir(repo.ID) {
+		t.Errorf("no-mistakes remote = %q, want %q", nmURL, p.RepoDir(repo.ID))
+	}
+	if has, err := gitpkg.HasRemote(context.Background(), p.RepoDir(repo.ID), "origin"); err != nil || has {
+		t.Errorf("gate should have no origin remote for a local-only repo; has=%v err=%v", has, err)
+	}
+}
+
+func TestInitNoOriginWithForkStillFails(t *testing.T) {
+	// --fork-url needs an origin to open PRs against, so it still fails with an
+	// actionable message when origin is absent.
+	work := filepath.Join(resolveSymlinks(t, t.TempDir()), "work")
 	if out, err := exec.Command("git", "init", work).CombinedOutput(); err != nil {
 		t.Fatalf("init: %v: %s", err, out)
 	}
@@ -845,13 +890,10 @@ func TestInitNoOrigin(t *testing.T) {
 	}
 	d := openTestDB(t, p)
 
-	_, _, err := Init(context.Background(), d, p, work)
+	_, _, err := InitWithFork(context.Background(), d, p, work, "git@github.com:you/my-repo.git")
 	if err == nil {
-		t.Fatal("expected error when no origin remote")
+		t.Fatal("expected error when no origin remote with --fork-url")
 	}
-	// The error must be actionable, not a raw git-plumbing leak: a fresh
-	// `git init` repo with no remote yet is a normal state, so tell the user
-	// how to fix it instead of surfacing `git remote get-url` exit codes.
 	msg := err.Error()
 	if !strings.Contains(msg, "git remote add origin") {
 		t.Errorf("error should tell the user how to add an origin remote; got: %q", msg)

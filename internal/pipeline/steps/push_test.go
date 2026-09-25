@@ -28,6 +28,37 @@ func setupGateMirror(t *testing.T, sctx *pipeline.StepContext) string {
 	return gateDir
 }
 
+// TestPushStep_LocalOnlyRepoSkips verifies the Push step refuses to run on a
+// local-only repository. The daemon already skips push at run creation, but
+// the step itself must also decline: resolveUpstreamURL returns the operator's
+// working repo path for local repos, so an unguarded push would write into the
+// working repo itself.
+func TestPushStep_LocalOnlyRepoSkips(t *testing.T) {
+	dir, baseSHA, submittedHead := setupGitRepo(t)
+	// Local-only: no origin remote, empty registered upstream.
+
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, submittedHead, config.Commands{})
+	sctx.Repo.UpstreamURL = ""
+	sctx.Repo.ForkURL = ""
+	sctx.Run.Branch = "refs/heads/feature"
+	// Prove the head is untouched: the step must skip before any git mutation.
+	headBefore := gitCmd(t, dir, "rev-parse", "HEAD")
+
+	outcome, err := (&PushStep{}).Execute(sctx)
+	if err != nil {
+		t.Fatalf("push on local-only repo should skip, not fail: %v", err)
+	}
+	if outcome == nil || !outcome.Skipped {
+		t.Fatalf("expected skipped outcome, got %+v", outcome)
+	}
+	if outcome.SkipReason == "" {
+		t.Error("expected a skip reason")
+	}
+	if after := gitCmd(t, dir, "rev-parse", "HEAD"); after != headBefore {
+		t.Errorf("push mutated the worktree head: before %s after %s", headBefore, after)
+	}
+}
+
 // TestPushStep_RefusesPostReviewClobberWithoutLaterPipelineCommit reproduces
 // the end-user incident at the real push boundary. Review approved R, then an
 // out-of-band reset replaced HEAD with divergent D and no pipeline-owned commit
