@@ -89,7 +89,10 @@ func (s *CrapStep) assess(sctx *pipeline.StepContext) (crap.Result, error) {
 		return crap.Result{}, err
 	}
 
-	baseSHA := resolveBranchBaseSHA(sctx.Ctx, sctx.WorkDir, sctx.Run.BaseSHA, sctx.Repo.DefaultBranch)
+	baseSHA, err := resolveBranchBaseSHA(sctx.Ctx, sctx, sctx.Run.BaseSHA, sctx.Repo.DefaultBranch)
+	if err != nil {
+		return crap.Result{}, err
+	}
 	headSHA := sctx.Run.HeadSHA
 	changed, changedPaths, err := s.changedScope(sctx, baseSHA, headSHA)
 	if err != nil {

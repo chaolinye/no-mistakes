@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -176,6 +177,7 @@ type Service struct {
 	beforeRecoverWorktreeMove         func()
 	beforeRecoverBranchMove           func()
 	afterRecoverBranchMove            func()
+	beforeRecoverRebind               func()
 }
 
 // remoteTimeout returns the bounded deadline budget for one remote
@@ -370,6 +372,17 @@ func (s *Service) Refresh(ctx context.Context) State {
 			state.Safety = "blocked_remote_rewritten"
 			state.Relation = RelationUnknown
 			state.Error = "the live remote no longer equals the persisted pipeline push binding; no files or refs were changed"
+			// A rewrite is never adopted implicitly. A terminal run offers the
+			// explicit guarded rebind (see recoverRemoteRewritten); an active
+			// run still owns its binding and must finish first.
+			// A merged or closed PR retired the branch: nothing is rebound.
+			if state.PRState == "merged" || state.PRState == "closed" {
+				state.NextAction = nil
+			} else if terminalRunStatus(freshRun.Status) {
+				state.NextAction = &NextAction{Code: "recover_remote_rewritten", Command: "no-mistakes axi sync --recover"}
+			} else {
+				state.NextAction = &NextAction{Code: "continue_active_run", Command: "no-mistakes axi status"}
+			}
 		}
 		return state
 	}
@@ -618,12 +631,19 @@ func (s *Service) BindRecoveryArchive(ctx context.Context, archiveRef string) St
 //     gate is available; otherwise the preserved head is verified through the
 //     gate's run-specific recovery ref and fetched into that anchor. Legacy terminal
 //     heads that still exist as unreferenced gate objects are anchored before
-//     recovery continues. A non-descendant live gate head is accepted only when
-//     the recorded head is the exact reviewed result, that reviewed result
-//     preserves the local work, and both commits have the same final tree. The
-//     live rewrite is not merged with local again because its content has
-//     already been proven identical to the reviewed result. The branch ref may
-//     independently lag or advance.
+//     recovery continues. A recorded head the terminal run never verified is
+//     accepted in exactly two shapes. Either the live gate branch is a
+//     non-descendant equal-tree rewrite of it: the recorded head is the exact
+//     reviewed result, that reviewed result preserves the local work, and both
+//     commits have the same final tree (the live rewrite is not merged with
+//     local again because its content has already been proven identical to the
+//     reviewed result). Or the recorded head EXTENDS the live gate branch
+//     (recordedHeadExtendsLiveGateBranch, issue #1421): the clean worktree sits
+//     exactly at it, the gate holds the object, and the live gate branch, the
+//     submitted head, and the review authority are all its ancestors - the
+//     reviewed result plus the pipeline's own later commits, stranded by a
+//     later step's non-code failure. The branch ref may independently lag or
+//     advance.
 //   - The only possible worktree mutation is a guarded move of a clean checked-out
 //     branch: a strict fast-forward, or an anchored move to a proven-containing
 //     head performed by Git operations that refuse on their own rather than by a
@@ -657,6 +677,12 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 		return refusal
 	}
 	state, run, _ := s.inspect(ctx)
+	// Only a live read can observe a rewritten remote, and a custody-returned
+	// run keeps a push binding a third party can still rewrite, so this check
+	// precedes every cached no-op below.
+	if rebound, handled := s.recoverRemoteRewritten(ctx, run, keepLocal); handled {
+		return rebound
+	}
 	if run != nil && run.CustodyReturnedAt != nil {
 		state.Recovered = true
 		state.Changed = false
@@ -694,62 +720,31 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 		if err != nil {
 			return blockedPlan(state, StatePipelineOwned, "blocked_recover_unverified_head", "the terminal run has no verified head and the preserved gate head could not be read; no files or refs were changed")
 		}
-		if gateHead != run.HeadSHA {
-			equalTreeRewrite := false
-			if !isAncestor(ctx, s.GateDir, run.HeadSHA, gateHead) {
-				recordedTree, recordedTreeErr := git.Run(ctx, s.GateDir, "rev-parse", run.HeadSHA+"^{tree}")
-				gateTree, gateTreeErr := git.Run(ctx, s.GateDir, "rev-parse", gateHead+"^{tree}")
-				recordedPreservesLocal := isAncestor(ctx, s.GateDir, state.Local.Head, run.HeadSHA) || preservedContainsLocalWork(ctx, s.GateDir, state.Local.Head, run.HeadSHA)
-				if recordedTreeErr != nil || gateTreeErr != nil || recordedTree != gateTree || !state.Local.Clean ||
-					run.ReviewApprovedHeadSHA == nil || *run.ReviewApprovedHeadSHA != run.HeadSHA || !recordedPreservesLocal {
-					return blockedPlan(state, StatePipelineOwned, "blocked_recover_unverified_head", "the terminal run has no verified head and the gate head does not descend from the recorded reviewed head with identical final content; no files or refs were changed")
-				}
-				if symbolic, err := git.Run(ctx, s.GateDir, "symbolic-ref", "-q", "refs/heads/"+branch); err == nil && symbolic != "" {
-					return blockedPlan(state, StatePipelineOwned, "blocked_recover_unverified_head", "the live gate branch is symbolic, so its terminal head cannot be verified; no files or refs were changed")
-				}
-				equalTreeRewrite = true
-				anchorRef := custody.RecoveryRef(run.ID)
-				if symbolic, err := git.Run(ctx, s.GateDir, "symbolic-ref", "-q", anchorRef); err == nil && symbolic != "" {
-					return blockedPlan(state, StatePipelineOwned, "blocked_recover_anchor_mismatch", "the run recovery ref in the local gate conflicts with the live gate head; no files or refs were changed")
-				}
-				anchored, anchorExists, anchorErr := git.ExactRefTarget(ctx, s.GateDir, anchorRef)
-				if anchorErr != nil || (anchorExists && anchored != gateHead) {
-					return blockedPlan(state, StatePipelineOwned, "blocked_recover_anchor_mismatch", "the run recovery ref in the local gate conflicts with the live gate head; no files or refs were changed")
-				}
-				if s.beforeRecoverTerminalHeadPreserve != nil {
-					s.beforeRecoverTerminalHeadPreserve()
-				}
-				branchNow, branchErr := git.CurrentBranch(ctx, s.workDir())
-				headNow, headErr := git.HeadSHA(ctx, s.workDir())
-				cleanNow, _ := worktreeClean(ctx, s.workDir())
-				if branchErr != nil || branchNow != state.Local.Branch || headErr != nil || headNow != state.Local.Head || !cleanNow {
-					return blockedPlan(state, StatePipelineOwned, "blocked_recover_assumptions_changed", "the local branch or worktree changed while the terminal head was being verified; no files or refs were changed")
-				}
-				anchorCommand := fmt.Sprintf("create %s %s\n", anchorRef, gateHead)
-				if anchorExists {
-					anchorCommand = fmt.Sprintf("verify %s %s\n", anchorRef, gateHead)
-				}
-				transaction := fmt.Sprintf("start\nverify refs/heads/%s %s\n%sprepare\ncommit\n", branch, gateHead, anchorCommand)
-				if _, err := git.RunWithInput(ctx, s.GateDir, transaction, "update-ref", "--stdin", "--no-deref"); err != nil {
-					return blockedPlan(state, StatePipelineOwned, "blocked_recover_assumptions_changed", "the live gate head or its create-only recovery ref changed while the terminal head was being verified; no files or refs were changed")
-				}
+		verifiedHead := gateHead
+		switch {
+		case gateHead == run.HeadSHA:
+			if err := s.DB.UpdateRunStatusWithVerifiedHead(run.ID, run.Status, gateHead); err != nil {
+				return blockedPlan(state, StatePipelineOwned, "blocked_recover_unverified_head", "the verified gate head could not be preserved; no files or refs were changed")
 			}
-			if equalTreeRewrite {
-				updated, err := s.DB.VerifyTerminalRunHeadRewrite(run.ID, run.Status, run.HeadSHA, gateHead)
-				if err != nil || !updated {
-					return blockedPlan(state, StatePipelineOwned, "blocked_recover_assumptions_changed", "the terminal run or its recorded review authority changed while the live gate head was being verified; the preserved recovery ref remains available and custody was not returned")
-				}
-			} else if err := s.DB.UpdateRunStatusWithVerifiedHead(run.ID, run.Status, gateHead); err != nil {
+		case isAncestor(ctx, s.GateDir, run.HeadSHA, gateHead):
+			if err := s.DB.UpdateRunStatusWithVerifiedHead(run.ID, run.Status, gateHead); err != nil {
 				return blockedPlan(state, StatePipelineOwned, "blocked_recover_unverified_head", "the verified gate head could not be recorded; the preserved recovery ref remains available and custody was not returned")
 			}
-		} else if err := s.DB.UpdateRunStatusWithVerifiedHead(run.ID, run.Status, gateHead); err != nil {
-			return blockedPlan(state, StatePipelineOwned, "blocked_recover_unverified_head", "the verified gate head could not be preserved; no files or refs were changed")
+		case recordedHeadExtendsLiveGateBranch(ctx, s.GateDir, state, run, gateHead):
+			if blocked, ok := s.verifyRecordedHeadExtendingGateBranch(ctx, state, run, gateHead); !ok {
+				return blocked
+			}
+			verifiedHead = run.HeadSHA
+		default:
+			if blocked, ok := s.verifyEqualTreeRewriteOfRecordedHead(ctx, state, run, gateHead); !ok {
+				return blocked
+			}
 		}
-		run.HeadSHA = gateHead
+		run.HeadSHA = verifiedHead
 		verifiedAt := time.Now().Unix()
 		run.TerminalHeadVerifiedAt = &verifiedAt
-		state.Pipeline.CurrentHead = gateHead
-		state.Relation = relationBetween(ctx, s.workDir(), state.Local.Head, gateHead)
+		state.Pipeline.CurrentHead = verifiedHead
+		state.Relation = relationBetween(ctx, s.workDir(), state.Local.Head, verifiedHead)
 	}
 	wd := s.workDir()
 	branch := state.Local.Branch
@@ -898,6 +893,142 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 		blocked.NextAction = &NextAction{Code: "inspect_and_reconcile_manually", Command: "git log --oneline --left-right HEAD..." + anchorRef}
 		return blocked
 	}
+}
+
+// recordedHeadExtendsLiveGateBranch is the fail-closed proof for the custody
+// deadlock in issue #1421: a run whose Review fix was approved, whose Test fix
+// then moved the head again, and which failed in a later non-code step
+// (Document's base fetch timed out) before Push. Its recorded head was never
+// terminally verified, the gate branch never moved off the submitted head
+// because pipeline commits land on a detached worktree, and the equal-tree
+// rewrite proof cannot apply because the recorded head is a descendant, not a
+// rewrite. Every documented next action then looped back to a refusal.
+//
+// The recorded head is accepted as the preserved head only when fresh gate
+// state proves both halves of "nothing is lost, and this is the gate's own
+// work", read from the gate's object store rather than from the database:
+//
+//   - the operator's worktree is clean and sits EXACTLY at the recorded head,
+//     so returning custody there moves nothing and can drop nothing local;
+//   - the recorded head is an object the gate holds (the run's worktree shared
+//     the gate's object store; a head typed into the database never is);
+//   - the live gate branch is an ancestor of the recorded head, and the
+//     submitted head, the recorded review authority, and the recorded head
+//     form one chain (submitted <= reviewed <= recorded), so nothing the gate
+//     branch holds, nothing the operator submitted, and nothing Review
+//     certified is absent from it - the head is the reviewed result plus the
+//     pipeline's own later commits, never a rewrite of either.
+//
+// Anything else - a behind or diverged worktree, a rebased preserved head (the
+// submitted head is no longer an ancestor), a run with no review authority, a
+// gate branch moved elsewhere, a pruned object - falls through to the existing
+// rewrite proof and its refusal. Moving a worktree ONTO an unverified head is
+// deliberately outside this proof; the operator checks the exact head out
+// first, which is what the issue's reporter had already done.
+func recordedHeadExtendsLiveGateBranch(ctx context.Context, gateDir string, state State, run *db.Run, gateHead string) bool {
+	recorded := strings.TrimSpace(run.HeadSHA)
+	if recorded == "" || gateHead == "" || gateHead == recorded {
+		return false
+	}
+	if !state.Local.Clean || state.Local.Head != recorded {
+		return false
+	}
+	if run.ReviewApprovedHeadSHA == nil || run.SubmittedHeadSHA == nil {
+		return false
+	}
+	reviewed := strings.TrimSpace(*run.ReviewApprovedHeadSHA)
+	submitted := strings.TrimSpace(*run.SubmittedHeadSHA)
+	if reviewed == "" || submitted == "" {
+		return false
+	}
+	if !objectExists(ctx, gateDir, recorded) {
+		return false
+	}
+	return isAncestor(ctx, gateDir, gateHead, recorded) &&
+		isAncestor(ctx, gateDir, submitted, reviewed) &&
+		isAncestor(ctx, gateDir, reviewed, recorded)
+}
+
+// verifyEqualTreeRewriteOfRecordedHead verifies the first accepted shape of an
+// unverified terminal head: the live gate branch is a non-descendant rewrite
+// of the exact reviewed result with an identical final tree, and that reviewed
+// result preserves the local work. The live gate head is anchored and becomes
+// the run's verified head; the live rewrite is not merged with local again
+// because its content has already been proven identical to the reviewed
+// result. It returns the refusal to report when any premise fails.
+func (s *Service) verifyEqualTreeRewriteOfRecordedHead(ctx context.Context, state State, run *db.Run, gateHead string) (State, bool) {
+	recordedTree, recordedTreeErr := git.Run(ctx, s.GateDir, "rev-parse", run.HeadSHA+"^{tree}")
+	gateTree, gateTreeErr := git.Run(ctx, s.GateDir, "rev-parse", gateHead+"^{tree}")
+	recordedPreservesLocal := isAncestor(ctx, s.GateDir, state.Local.Head, run.HeadSHA) || preservedContainsLocalWork(ctx, s.GateDir, state.Local.Head, run.HeadSHA)
+	if recordedTreeErr != nil || gateTreeErr != nil || recordedTree != gateTree || !state.Local.Clean ||
+		run.ReviewApprovedHeadSHA == nil || *run.ReviewApprovedHeadSHA != run.HeadSHA || !recordedPreservesLocal {
+		return blockedPlan(state, StatePipelineOwned, "blocked_recover_unverified_head", "the terminal run has no verified head and the gate head does not descend from the recorded reviewed head with identical final content; no files or refs were changed"), false
+	}
+	if blocked, ok := s.anchorUnverifiedTerminalHead(ctx, state, run, gateHead, gateHead, state.Local.Head); !ok {
+		return blocked, false
+	}
+	updated, err := s.DB.VerifyTerminalRunHeadRewrite(run.ID, run.Status, run.HeadSHA, gateHead)
+	if err != nil || !updated {
+		return blockedPlan(state, StatePipelineOwned, "blocked_recover_assumptions_changed", "the terminal run or its recorded review authority changed while the live gate head was being verified; the preserved recovery ref remains available and custody was not returned"), false
+	}
+	return State{}, true
+}
+
+// verifyRecordedHeadExtendingGateBranch records the proof from
+// recordedHeadExtendsLiveGateBranch: it anchors the recorded head itself and
+// stamps it as the run's verified terminal head with a compare-and-swap on
+// everything the proof read. It returns the refusal to report when any of
+// that fails.
+func (s *Service) verifyRecordedHeadExtendingGateBranch(ctx context.Context, state State, run *db.Run, gateHead string) (State, bool) {
+	if blocked, ok := s.anchorUnverifiedTerminalHead(ctx, state, run, gateHead, run.HeadSHA, run.HeadSHA); !ok {
+		return blocked, false
+	}
+	updated, err := s.DB.VerifyTerminalRunRecordedHead(run.ID, run.Status, run.HeadSHA, *run.ReviewApprovedHeadSHA)
+	if err != nil || !updated {
+		return blockedPlan(state, StatePipelineOwned, "blocked_recover_assumptions_changed", "the terminal run or its recorded review authority changed while the recorded head was being verified; the preserved recovery ref remains available and custody was not returned"), false
+	}
+	return State{}, true
+}
+
+// anchorUnverifiedTerminalHead is the one owner of the ref writes both
+// unverified-head proofs end in. It refuses a symbolic live gate branch and a
+// symbolic or conflicting run recovery ref, re-reads the invoking worktree so
+// its branch, head (expectedLocalHead) and cleanliness still match what the
+// proof read, and then anchors anchorTarget at the run's create-only recovery
+// ref in one update-ref transaction that also verifies the live gate branch is
+// still at gateHead. Nothing is written when any of that fails. Callers stamp
+// the database afterwards with their own compare-and-swap.
+func (s *Service) anchorUnverifiedTerminalHead(ctx context.Context, state State, run *db.Run, gateHead, anchorTarget, expectedLocalHead string) (State, bool) {
+	branch := state.Local.Branch
+	if symbolic, err := git.Run(ctx, s.GateDir, "symbolic-ref", "-q", "refs/heads/"+branch); err == nil && symbolic != "" {
+		return blockedPlan(state, StatePipelineOwned, "blocked_recover_unverified_head", "the live gate branch is symbolic, so its terminal head cannot be verified; no files or refs were changed"), false
+	}
+	anchorRef := custody.RecoveryRef(run.ID)
+	if symbolic, err := git.Run(ctx, s.GateDir, "symbolic-ref", "-q", anchorRef); err == nil && symbolic != "" {
+		return blockedPlan(state, StatePipelineOwned, "blocked_recover_anchor_mismatch", "the run recovery ref in the local gate conflicts with the terminal head being verified; inspect both objects before returning custody; no files or refs were changed"), false
+	}
+	anchored, anchorExists, anchorErr := git.ExactRefTarget(ctx, s.GateDir, anchorRef)
+	if anchorErr != nil || (anchorExists && anchored != anchorTarget) {
+		return blockedPlan(state, StatePipelineOwned, "blocked_recover_anchor_mismatch", "the run recovery ref in the local gate conflicts with the terminal head being verified; inspect both objects before returning custody; no files or refs were changed"), false
+	}
+	if s.beforeRecoverTerminalHeadPreserve != nil {
+		s.beforeRecoverTerminalHeadPreserve()
+	}
+	branchNow, branchErr := git.CurrentBranch(ctx, s.workDir())
+	headNow, headErr := git.HeadSHA(ctx, s.workDir())
+	cleanNow, _ := worktreeClean(ctx, s.workDir())
+	if branchErr != nil || branchNow != branch || headErr != nil || headNow != expectedLocalHead || !cleanNow {
+		return blockedPlan(state, StatePipelineOwned, "blocked_recover_assumptions_changed", "the local branch or worktree changed while the terminal head was being verified; no files or refs were changed"), false
+	}
+	anchorCommand := fmt.Sprintf("create %s %s\n", anchorRef, anchorTarget)
+	if anchorExists {
+		anchorCommand = fmt.Sprintf("verify %s %s\n", anchorRef, anchorTarget)
+	}
+	transaction := fmt.Sprintf("start\nverify refs/heads/%s %s\n%sprepare\ncommit\n", branch, gateHead, anchorCommand)
+	if _, err := git.RunWithInput(ctx, s.GateDir, transaction, "update-ref", "--stdin", "--no-deref"); err != nil {
+		return blockedPlan(state, StatePipelineOwned, "blocked_recover_assumptions_changed", "the live gate head or its create-only recovery ref changed while the terminal head was being verified; no files or refs were changed"), false
+	}
+	return State{}, true
 }
 
 // recoverKeepLocal performs the explicit keep-local custody return: the
@@ -1295,6 +1426,164 @@ func (s *Service) recoverAdoptPreserved(ctx context.Context, run *db.Run, state 
 		return state
 	}
 	return s.finishRecover(ctx, run, true)
+}
+
+// recoverRemoteRewritten owns Recover's outcome for a terminal run whose push
+// binding is the recorded truth: a published run or a custody-returned one.
+// Its success decision is an allowlist. Recovered is true only when (a) the
+// explicit recover_remote_rewritten rebind committed, or (b) a fresh live
+// check proved the binding already equals the live head, in which case the
+// caller's ordinary idempotent path decides (handled=false). Every other fresh
+// outcome refuses with Recovered=false and never reaches a cached no-op.
+// Runs whose head moved past an unpublished binding keep the ordinary custody
+// recovery (handled=false without a live check).
+//
+// The rebind re-verifies the live remote with a fresh Refresh, anchors the
+// superseded pipeline push head before changing anything, confirms the live
+// head did not move again, then compare-and-swaps the persisted push binding
+// to the verified live head. It never touches the worktree, a branch ref, the
+// gate branch, or the remote, and stamps no custody.
+func (s *Service) recoverRemoteRewritten(ctx context.Context, run *db.Run, keepLocal bool) (State, bool) {
+	if run == nil || !terminalRunStatus(run.Status) || run.LastPushedSHA == nil || unpublishedPipelineHead(run) {
+		return State{}, false
+	}
+	fresh := s.Refresh(ctx)
+	switch fresh.Safety {
+	case "blocked_offline", "blocked_remote_changed_during_refresh", "blocked_binding_changed":
+		blocked := blockedPlan(fresh, fresh.State, fresh.Safety, "the live push target could not be verified, so nothing was recovered; no files or refs were changed")
+		blocked.NextAction = &NextAction{Code: "retry", Command: "no-mistakes axi sync --recover"}
+		return blocked, true
+	}
+	if fresh.Pipeline.RunID == run.ID && fresh.Remote.Freshness == "live" && fresh.Remote.ObservedHead != "" &&
+		fresh.Remote.ObservedHead == ptr(run.LastPushedSHA) && fresh.Pipeline.PushedHead == fresh.Remote.ObservedHead {
+		return State{}, false
+	}
+	if fresh.Safety != "blocked_remote_rewritten" || fresh.Pipeline.RunID != run.ID || fresh.Remote.Freshness != "live" ||
+		fresh.Remote.ObservedHead == "" || fresh.NextAction == nil || fresh.NextAction.Code != "recover_remote_rewritten" {
+		return refuseUnverifiedPushBinding(fresh), true
+	}
+	if keepLocal {
+		return blockedPlan(fresh, StateRemoteRewritten, "blocked_recover_keep_local_not_applicable", "--keep-local does not apply to a remote rewritten outside the pipeline; run `no-mistakes axi sync --recover` to rebind the push binding to the verified live head; no files or refs were changed"), true
+	}
+	live := fresh.Remote.ObservedHead
+	superseded := fresh.Pipeline.PushedHead
+	generation := fresh.Pipeline.PushGeneration
+	anchorRef, anchoredIn, ok := s.anchorSupersededPushHead(ctx, run.ID, generation, superseded)
+	if !ok {
+		return blockedPlan(fresh, StateRemoteRewritten, "blocked_recover_preserve_failed", fmt.Sprintf("the superseded pipeline head %s could not be anchored in the worktree or local gate, so rebinding would drop the last record of it; no files or refs were changed", superseded)), true
+	}
+	if s.beforeRecoverRebind != nil {
+		s.beforeRecoverRebind()
+	}
+	repo, repoErr := s.DB.GetRepo(s.Repo.ID)
+	if repoErr != nil || repo == nil {
+		return blockedPlan(fresh, StateRemoteRewritten, "blocked_recover_assumptions_changed", "the repository record could not be re-read before rebinding; the push binding was not changed"), true
+	}
+	lsCtx, lsCancel := context.WithTimeout(ctx, s.remoteTimeout())
+	defer lsCancel()
+	again, err := s.runLsRemote(lsCtx, s.workDir(), repo.PushURL(), fresh.Target.Ref)
+	if err != nil || again != live {
+		blocked := blockedPlan(fresh, StateRemoteRewritten, "blocked_recover_remote_changed", fmt.Sprintf("the live remote changed again before the push binding could be rebound; the push binding was not changed and the superseded pipeline head stays anchored at %s", anchorRef))
+		blocked.NextAction = &NextAction{Code: "retry", Command: "no-mistakes axi sync --check"}
+		return blocked, true
+	}
+	recheck, _, ok := s.inspect(ctx)
+	if !ok || recheck.Local.Branch != fresh.Local.Branch || recheck.Local.Head != fresh.Local.Head || !recheck.Local.Clean {
+		return blockedPlan(recheck, StateAmbiguousContext, "blocked_recover_assumptions_changed", fmt.Sprintf("the invoking worktree changed before the push binding could be rebound; the push binding was not changed and the superseded pipeline head stays anchored at %s", anchorRef)), true
+	}
+	rebound, err := s.DB.RebindRunPushedHead(run.ID, db.PushRebind{
+		Status: run.Status, ExpectedPushed: superseded, ExpectedGeneration: generation,
+		ExpectedHead: run.HeadSHA, PRState: run.PRState, CustodyReturned: run.CustodyReturnedAt != nil,
+		UpstreamURL: repo.UpstreamURL, ForkURL: repo.ForkURL, TargetKind: targetKind(repo),
+		TargetFingerprint: TargetFingerprint(repo.PushURL()), Ref: fresh.Target.Ref, Head: live,
+	})
+	if err != nil || !rebound {
+		return blockedPlan(fresh, StateRemoteRewritten, "blocked_recover_assumptions_changed", fmt.Sprintf("the run or its push binding changed before it could be rebound; the push binding was not changed and the superseded pipeline head stays anchored at %s", anchorRef)), true
+	}
+	state, _, _ := s.inspect(ctx)
+	after, afterErr := s.DB.GetRun(run.ID)
+	if afterErr != nil || after == nil || ptr(after.LastPushedSHA) != live || value(after.PushGeneration) != generation+1 ||
+		state.Pipeline.RunID != run.ID || !reboundStateUsable(state) {
+		return blockedPlan(state, state.State, "blocked_recover_ownership_changed", fmt.Sprintf("the push binding was rebound to %s, but this run no longer owns the branch or its binding could not be confirmed; the superseded pipeline head stays anchored at %s", live, anchorRef)), true
+	}
+	state.Recovered = true
+	state.Changed = false
+	state.Recovery = &RecoveryEvidence{
+		Source: "remote_rewritten", RepositoryID: s.Repo.ID, RunID: run.ID, Branch: fresh.Local.Branch,
+		RequiredHead: live, PreservedHead: superseded, ArchiveRef: anchorRef, Proof: anchoredIn,
+	}
+	note := fmt.Sprintf("the superseded pipeline head was anchored at %s; the branch, worktree, and remote were not changed", anchorRef)
+	if state.Error != "" {
+		note += "; " + strings.TrimSuffix(state.Error, "; no files or refs were changed")
+	}
+	state.Error = note
+	return state, true
+}
+
+// reboundStateUsable reports whether post-rebind inspection classifies the
+// branch against the new binding as the operator's ordinary relation to it.
+// Pipeline ownership, an in-progress push, or any context/target refusal means
+// the rebind did not leave a usable binding, so recovery is not reported.
+// Divergence from a foreign rewrite is an ordinary relation with its own
+// next action, not a recovery failure.
+func reboundStateUsable(state State) bool {
+	switch state.State {
+	case StateSynchronized, StateBehind, StateLocalAhead, StateDiverged:
+		return true
+	default:
+		return false
+	}
+}
+
+// refuseUnverifiedPushBinding turns a fresh state that neither proves the push
+// binding nor offers the rewrite rebind into a recovery refusal. It keeps the
+// fresh reason and guidance so the operator sees why nothing was recovered.
+func refuseUnverifiedPushBinding(fresh State) State {
+	blocked := fresh
+	blocked.Recovered = false
+	blocked.Changed = false
+	if !strings.HasPrefix(blocked.Safety, "blocked_") {
+		blocked.Safety = "blocked_recover_live_unverified"
+	}
+	if blocked.Error == "" {
+		blocked.Error = "a fresh live check did not prove the pipeline push binding, so nothing was recovered; no files or refs were changed"
+	} else {
+		blocked.Error = "nothing was recovered: " + blocked.Error
+	}
+	return blocked
+}
+
+// anchorSupersededPushHead keeps the pipeline head a rewritten remote replaced
+// reachable before the binding stops recording it. It anchors in the worktree
+// when the object is there, else in the local gate, and never replaces an
+// existing conflicting anchor.
+func (s *Service) anchorSupersededPushHead(ctx context.Context, runID string, generation int64, superseded string) (string, string, bool) {
+	ref := rewrittenAnchorRef(runID, generation)
+	if superseded == "" {
+		return ref, "", false
+	}
+	candidates := []struct{ dir, name string }{{s.workDir(), "worktree"}}
+	if gateDir := strings.TrimSpace(s.GateDir); gateDir != "" {
+		candidates = append(candidates, struct{ dir, name string }{gateDir, "gate"})
+	}
+	for _, candidate := range candidates {
+		if !objectExists(ctx, candidate.dir, superseded) {
+			continue
+		}
+		if err := custody.PreserveRecoveryAnchor(ctx, candidate.dir, ref, superseded); err != nil {
+			return ref, "", false
+		}
+		anchored, err := git.Run(ctx, candidate.dir, "rev-parse", ref+"^{commit}")
+		return ref, candidate.name, err == nil && anchored == superseded
+	}
+	return ref, "", false
+}
+
+// rewrittenAnchorRef names the anchor for the pipeline push head superseded by
+// a remote rewrite. The binding generation keeps each superseded head distinct
+// if the same run's remote is rewritten again after a rebind.
+func rewrittenAnchorRef(runID string, generation int64) string {
+	return "refs/no-mistakes/recover-rewritten/" + runID + "/" + strconv.FormatInt(generation, 10)
 }
 
 func (s *Service) anchorReachablePreserved(ctx context.Context, state State, runID, preserved string) (State, bool) {
@@ -1710,7 +1999,7 @@ func (s *Service) classifyRelation(ctx context.Context, state *State, pushed, ba
 			state.State = StateDiverged
 			state.Relation = RelationDiverged
 			state.Safety = "blocked_diverged"
-			state.NextAction = &NextAction{Code: "inspect_and_reconcile_manually", Command: "git log --oneline --left-right HEAD..." + pushed}
+			state.NextAction = &NextAction{Code: "inspect_and_reconcile_manually", Command: "git checkout --detach " + pushed}
 			state.Error = "local and pipeline-pushed histories have diverged; no files or refs were changed"
 			return
 		}
